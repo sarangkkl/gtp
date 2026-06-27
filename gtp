@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# gtp — git persona manager
+# Manage multiple GitHub accounts with zero dependencies.
+# Config stored in ~/.gitpersona/
+
+set -euo pipefail
+
+GTP_DIR="${HOME}/.gitpersona"
+GTP_PROFILES_DIR="${GTP_DIR}/profiles"
+GTP_ACTIVE_FILE="${GTP_DIR}/active"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BOLD=$'\033[1m'
+RESET=$'\033[0m'
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+gtp_info()    { echo -e "${GREEN}$*${RESET}"; }
+gtp_warn()    { echo -e "${YELLOW}$*${RESET}"; }
+gtp_error()   { echo -e "${RED}Error: $*${RESET}" >&2; exit 1; }
+gtp_bold()    { echo -e "${BOLD}$*${RESET}"; }
+
+gtp_ensure_dirs() {
+  mkdir -p "${GTP_PROFILES_DIR}"
+}
+
+gtp_validate_alias() {
+  local alias="$1"
+  if [[ ! "$alias" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    gtp_error "Profile alias '${alias}' is invalid. Use only letters, numbers, hyphens, and underscores."
+  fi
+}
+
+gtp_profile_exists() {
+  local alias="$1"
+  [[ -d "${GTP_PROFILES_DIR}/${alias}" ]]
+}
+
+gtp_load_profile() {
+  # Exports: GTP_USERNAME GTP_NAME GTP_EMAIL GTP_TOKEN
+  local alias="$1"
+  local profile_dir="${GTP_PROFILES_DIR}/${alias}"
+  if [[ ! -d "$profile_dir" ]]; then
+    gtp_error "Profile '${alias}' not found. Run: gtp list"
+  fi
+  GTP_USERNAME=$(cat "${profile_dir}/username" 2>/dev/null || echo "")
+  GTP_NAME=$(cat "${profile_dir}/name"     2>/dev/null || echo "")
+  GTP_EMAIL=$(cat "${profile_dir}/email"   2>/dev/null || echo "")
+  GTP_TOKEN=$(cat "${profile_dir}/token"   2>/dev/null || echo "")
+}
+
+gtp_save_profile() {
+  local alias="$1" username="$2" name="$3" email="$4" token="$5"
+  local profile_dir="${GTP_PROFILES_DIR}/${alias}"
+  mkdir -p "$profile_dir"
+  echo "$username" > "${profile_dir}/username"
+  echo "$name"     > "${profile_dir}/name"
+  echo "$email"    > "${profile_dir}/email"
+  echo "$token"    > "${profile_dir}/token"
+  chmod 600 "${profile_dir}/token"
+}
+
+gtp_get_active() {
+  cat "${GTP_ACTIVE_FILE}" 2>/dev/null || echo ""
+}
+
+gtp_set_active() {
+  gtp_ensure_dirs
+  echo "$1" > "${GTP_ACTIVE_FILE}"
+}
+
+gtp_require_active() {
+  local active
+  active=$(gtp_get_active)
+  if [[ -z "$active" ]]; then
+    gtp_error "No active profile. Run: gtp use <profile>"
+  fi
+  if ! gtp_profile_exists "$active"; then
+    gtp_error "Active profile '${active}' no longer exists. Run: gtp use <profile>"
+  fi
+  echo "$active"
+}
+
+gtp_mask_token() {
+  local token="$1"
+  if [[ ${#token} -le 4 ]]; then
+    echo "$token"
+    return
+  fi
+  local suffix="${token: -4}"
+  printf '****%s' "$suffix"
+}
+
+# Infer the local directory git clone will create from URL + extra args
+# Tries to find the last non-flag, non-value argument; falls back to URL basename
+gtp_infer_repo_dir() {
+  local url="$1"; shift
+  local args=("$@")
+
+  # Flags that consume the next argument (value flags)
+  local -a value_flags=(-b --branch -o --origin -u --upload-pack
+    --template --reference --reference-if-able --separate-git-dir
+    --depth --shallow-since --shallow-exclude -j --jobs --filter
+    --recurse-submodules --shallow-submodules --no-shallow-submodules
+    --remote-submodules --no-remote-submodules)
+
+  local last_positional=""
+  local skip_next=false
+
+  for arg in "${args[@]}"; do
+    if $skip_next; then
+      skip_next=false
+      continue
+    fi
+    # Check if this arg is a value-consuming flag
+    local is_value_flag=false
+    for vf in "${value_flags[@]}"; do
+      if [[ "$arg" == "$vf" ]]; then
+        is_value_flag=true
+        break
+      fi
+    done
+    if $is_value_flag; then
+      skip_next=true
+      continue
+    fi
+    # Skip flag-style args (--foo or -x but not positional)
+    if [[ "$arg" == --* ]] || [[ "$arg" == -* && ${#arg} -eq 2 ]]; then
+      continue
+    fi
+    last_positional="$arg"
+  done
+
+  if [[ -n "$last_positional" ]]; then
+    echo "$last_positional"
+  else
+    # Derive from URL: take basename, strip .git
+    local dir
+    dir=$(basename "$url")
+    dir="${dir%.git}"
+    echo "$dir"
+  fi
+}
+
+gtp_inject_token_url() {
+  local url="$1" token="$2"
+  # Insert token@ after the protocol: https:// → https://TOKEN@
+  # Handles existing auth in URL by replacing up to the first @, or inserting after ://
+  if [[ "$url" =~ ^(https?://)([^@]*@)?(.*)$ ]]; then
+    echo "${BASH_REMATCH[1]}${token}@${BASH_REMATCH[3]}"
+  else
+    echo "$url"
+  fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_setup_new_account() {
+  gtp_ensure_dirs
+  gtp_bold "=== New GitHub Profile Setup ==="
+  echo ""
+
+  # Alias
+  local alias=""
+  while true; do
+    read -r -p "Profile alias (e.g. 'work', 'personal'): " alias
+    if [[ -z "$alias" ]]; then
+      echo "Alias cannot be empty."
+      continue
+    fi
+    if [[ ! "$alias" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+      echo "Invalid alias. Use only letters, numbers, hyphens, and underscores."
+      continue
+    fi
+    break
+  done
+
+  if gtp_profile_exists "$alias"; then
+    local confirm=""
+    read -r -p "Profile '${alias}' already exists. Overwrite? [y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo "Aborted."
+      exit 0
+    fi
+  fi
+
+  local username="" name="" email="" token=""
+
+  read -r -p "GitHub username: " username
+  [[ -z "$username" ]] && gtp_error "Username cannot be empty."
+
+  read -r -p "Display name (for git commits): " name
+  [[ -z "$name" ]] && gtp_error "Display name cannot be empty."
+
+  read -r -p "Email (for git commits): " email
+  [[ -z "$email" ]] && gtp_error "Email cannot be empty."
+
+  # Hide token input
+  read -r -s -p "GitHub personal access token: " token
+  echo ""
+  [[ -z "$token" ]] && gtp_error "Token cannot be empty."
+
+  gtp_save_profile "$alias" "$username" "$name" "$email" "$token"
+
+  # Auto-activate if first profile or no active set
+  local active
+  active=$(gtp_get_active)
+  if [[ -z "$active" ]] || ! gtp_profile_exists "$active"; then
+    gtp_set_active "$alias"
+    gtp_info "Profile '${alias}' saved and set as active."
+  else
+    gtp_info "Profile '${alias}' saved. Run 'gtp use ${alias}' to activate it."
+  fi
+}
+
+cmd_use() {
+  local alias="${1:-}"
+  [[ -z "$alias" ]] && gtp_error "Usage: gtp use <profile>"
+  gtp_validate_alias "$alias"
+  if ! gtp_profile_exists "$alias"; then
+    gtp_error "Profile '${alias}' not found. Run: gtp list"
+  fi
+  gtp_set_active "$alias"
+  gtp_load_profile "$alias"
+  gtp_info "Switched to profile '${alias}' (${GTP_USERNAME} / ${GTP_EMAIL})."
+}
+
+cmd_status() {
+  gtp_ensure_dirs
+  local active
+  active=$(gtp_get_active)
+
+  # Check if any profiles exist
+  local profiles=()
+  if [[ -d "$GTP_PROFILES_DIR" ]]; then
+    while IFS= read -r -d '' dir; do
+      profiles+=("$(basename "$dir")")
+    done < <(find "$GTP_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
+  fi
+
+  if [[ ${#profiles[@]} -eq 0 ]]; then
+    gtp_warn "No profiles configured. Run: gtp setup_new_account"
+    return
+  fi
+
+  if [[ -n "$active" ]] && gtp_profile_exists "$active"; then
+    gtp_load_profile "$active"
+    gtp_bold "=== Active Profile ==="
+    printf "  %-10s %s\n" "Alias:"    "$active"
+    printf "  %-10s %s\n" "Username:" "$GTP_USERNAME"
+    printf "  %-10s %s\n" "Name:"     "$GTP_NAME"
+    printf "  %-10s %s\n" "Email:"    "$GTP_EMAIL"
+    printf "  %-10s %s\n" "Token:"    "$(gtp_mask_token "$GTP_TOKEN")"
+    echo ""
+  else
+    gtp_warn "No active profile set. Run: gtp use <profile>"
+    echo ""
+  fi
+
+  gtp_bold "=== All Profiles ==="
+  printf "  %-14s %-22s %-30s\n" "ALIAS" "USERNAME" "EMAIL"
+  printf "  %s\n" "$(printf '─%.0s' {1..70})"
+  for alias in "${profiles[@]}"; do
+    gtp_load_profile "$alias"
+    local marker="  "
+    [[ "$alias" == "$active" ]] && marker="* "
+    printf "  %s%-12s %-22s %s\n" "$marker" "$alias" "$GTP_USERNAME" "$GTP_EMAIL"
+  done
+  echo ""
+  [[ -n "$active" ]] && echo "  (* = active profile)"
+}
+
+cmd_list() {
+  gtp_ensure_dirs
+  local active
+  active=$(gtp_get_active)
+
+  local profiles=()
+  if [[ -d "$GTP_PROFILES_DIR" ]]; then
+    while IFS= read -r -d '' dir; do
+      profiles+=("$(basename "$dir")")
+    done < <(find "$GTP_PROFILES_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
+  fi
+
+  if [[ ${#profiles[@]} -eq 0 ]]; then
+    gtp_warn "No profiles configured. Run: gtp setup_new_account"
+    return
+  fi
+
+  gtp_bold "$(printf '%-14s %-22s %-30s %s' 'ALIAS' 'USERNAME' 'EMAIL' 'STATUS')"
+  printf '%s\n' "$(printf '─%.0s' {1..75})"
+  for alias in "${profiles[@]}"; do
+    gtp_load_profile "$alias"
+    local status=""
+    [[ "$alias" == "$active" ]] && status="(active)"
+    printf "%-14s %-22s %-30s %s\n" "$alias" "$GTP_USERNAME" "$GTP_EMAIL" "$status"
+  done
+}
+
+cmd_edit() {
+  local alias="${1:-}"
+  [[ -z "$alias" ]] && gtp_error "Usage: gtp edit <profile>"
+  gtp_validate_alias "$alias"
+  if ! gtp_profile_exists "$alias"; then
+    gtp_error "Profile '${alias}' not found. Run: gtp list"
+  fi
+
+  gtp_load_profile "$alias"
+  local cur_username="$GTP_USERNAME"
+  local cur_name="$GTP_NAME"
+  local cur_email="$GTP_EMAIL"
+  local cur_token="$GTP_TOKEN"
+
+  gtp_bold "=== Edit Profile: ${alias} ==="
+  echo "Press Enter to keep the existing value."
+  echo ""
+
+  local username="" name="" email="" token=""
+
+  read -r -p "GitHub username [${cur_username}]: " username
+  [[ -z "$username" ]] && username="$cur_username"
+
+  read -r -p "Display name [${cur_name}]: " name
+  [[ -z "$name" ]] && name="$cur_name"
+
+  read -r -p "Email [${cur_email}]: " email
+  [[ -z "$email" ]] && email="$cur_email"
+
+  read -r -s -p "GitHub token [$(gtp_mask_token "$cur_token")]: " token
+  echo ""
+  [[ -z "$token" ]] && token="$cur_token"
+
+  gtp_save_profile "$alias" "$username" "$name" "$email" "$token"
+  gtp_info "Profile '${alias}' updated."
+}
+
+cmd_remove() {
+  local alias="${1:-}"
+  [[ -z "$alias" ]] && gtp_error "Usage: gtp remove <profile>"
+  gtp_validate_alias "$alias"
+  if ! gtp_profile_exists "$alias"; then
+    gtp_error "Profile '${alias}' not found. Run: gtp list"
+  fi
+
+  local confirm=""
+  read -r -p "Delete profile '${alias}'? [y/N] " confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 0
+  fi
+
+  rm -rf "${GTP_PROFILES_DIR:?}/${alias}"
+
+  local active
+  active=$(gtp_get_active)
+  if [[ "$active" == "$alias" ]]; then
+    echo "" > "${GTP_ACTIVE_FILE}"
+    gtp_warn "Profile '${alias}' deleted. No active profile. Run: gtp use <profile>"
+  else
+    gtp_info "Profile '${alias}' deleted."
+  fi
+}
+
+cmd_git() {
+  local active
+  active=$(gtp_require_active)
+  gtp_load_profile "$active"
+
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: gtp git <subcommand> [args]"
+    exit 1
+  fi
+
+  local subcmd="$1"; shift
+
+  case "$subcmd" in
+    clone)
+      _git_clone "$@"
+      ;;
+    commit|tag|merge|rebase|cherry-pick|am)
+      GIT_AUTHOR_NAME="$GTP_NAME" \
+      GIT_AUTHOR_EMAIL="$GTP_EMAIL" \
+      GIT_COMMITTER_NAME="$GTP_NAME" \
+      GIT_COMMITTER_EMAIL="$GTP_EMAIL" \
+      git "$subcmd" "$@"
+      ;;
+    push|pull|fetch)
+      git \
+        -c credential.helper= \
+        -c "credential.helper=!f(){ echo username=${GTP_USERNAME}; echo password=${GTP_TOKEN}; }; f" \
+        -c "user.name=${GTP_NAME}" \
+        -c "user.email=${GTP_EMAIL}" \
+        "$subcmd" "$@"
+      ;;
+    *)
+      exec git "$subcmd" "$@"
+      ;;
+  esac
+}
+
+_git_clone() {
+  # Find the URL: first non-flag argument after 'clone'
+  local url=""
+  local extra_args=()
+  local args=("$@")
+  local -a value_flags=(-b --branch -o --origin -u --upload-pack
+    --template --reference --reference-if-able --separate-git-dir
+    --depth --shallow-since --shallow-exclude -j --jobs --filter)
+  local skip_next=false
+
+  for i in "${!args[@]}"; do
+    local arg="${args[$i]}"
+    if $skip_next; then
+      skip_next=false
+      extra_args+=("$arg")
+      continue
+    fi
+    local is_vf=false
+    for vf in "${value_flags[@]}"; do
+      [[ "$arg" == "$vf" ]] && { is_vf=true; break; }
+    done
+    if $is_vf; then
+      skip_next=true
+      extra_args+=("$arg")
+      continue
+    fi
+    if [[ "$arg" == -* ]]; then
+      extra_args+=("$arg")
+      continue
+    fi
+    if [[ -z "$url" ]]; then
+      url="$arg"
+    else
+      extra_args+=("$arg")
+    fi
+  done
+
+  if [[ -z "$url" ]]; then
+    # No URL provided — let git produce its own error
+    git clone "$@"
+    exit $?
+  fi
+
+  local clone_url="$url"
+
+  if [[ "$url" =~ ^https?:// ]]; then
+    clone_url=$(gtp_inject_token_url "$url" "$GTP_TOKEN")
+  elif [[ "$url" =~ ^git@ ]] || [[ "$url" =~ ^ssh:// ]]; then
+    gtp_warn "Warning: SSH URL detected. Token injection skipped. Ensure your SSH key is configured for this account."
+  fi
+
+  # Infer destination directory
+  local repo_dir
+  repo_dir=$(gtp_infer_repo_dir "$url" "${extra_args[@]+"${extra_args[@]}"}")
+
+  git clone "$clone_url" "${extra_args[@]+"${extra_args[@]}"}"
+  local exit_code=$?
+
+  if [[ $exit_code -eq 0 ]] && [[ -d "$repo_dir" ]]; then
+    git -C "$repo_dir" config user.name  "$GTP_NAME"
+    git -C "$repo_dir" config user.email "$GTP_EMAIL"
+    gtp_info "Set user.name='${GTP_NAME}' and user.email='${GTP_EMAIL}' in '${repo_dir}'."
+  elif [[ $exit_code -eq 0 ]]; then
+    gtp_warn "Clone succeeded but could not find '${repo_dir}' to set local git identity. Set it manually with: git config user.name / user.email"
+  fi
+
+  exit $exit_code
+}
+
+cmd_help() {
+  cat <<EOF
+
+${BOLD}gtp${RESET} — git persona manager
+
+${BOLD}USAGE${RESET}
+  gtp <command> [args]
+
+${BOLD}PROFILE COMMANDS${RESET}
+  setup_new_account     Interactive wizard to add a new GitHub profile
+  use <profile>         Switch the active profile
+  status                Show active profile and all saved profiles
+  list                  List all profiles in a table
+  edit <profile>        Update an existing profile
+  remove <profile>      Delete a profile
+
+${BOLD}GIT COMMANDS${RESET}
+  git clone <url>       Clone with token injected (HTTPS) + set local identity
+  git commit [args]     Commit using the active profile's identity
+  git push [args]       Push using the active profile's token
+  git pull [args]       Pull using the active profile's token
+  git fetch [args]      Fetch using the active profile's token
+  git <anything>        Passthrough to git (status, log, diff, add, etc.)
+
+${BOLD}OTHER${RESET}
+  help                  Show this help message
+  version               Show gtp version
+
+${BOLD}EXAMPLES${RESET}
+  gtp setup_new_account
+  gtp use work
+  gtp git clone https://github.com/org/repo.git
+  gtp git commit -m "feat: add feature"
+  gtp git push
+
+${BOLD}CONFIG${RESET}
+  Profiles stored in: ~/.gitpersona/profiles/<alias>/
+  Active profile in:  ~/.gitpersona/active
+
+EOF
+}
+
+# ── Main dispatcher ───────────────────────────────────────────────────────────
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    setup_new_account)  cmd_setup_new_account "$@" ;;
+    use)                cmd_use "$@" ;;
+    status)             cmd_status "$@" ;;
+    list)               cmd_list "$@" ;;
+    edit)               cmd_edit "$@" ;;
+    remove)             cmd_remove "$@" ;;
+    git)                cmd_git "$@" ;;
+    help|--help|-h)     cmd_help ;;
+    version|--version)  echo "gtp version 1.0.0" ;;
+    *)
+      echo -e "${RED}Unknown command: ${command}${RESET}" >&2
+      echo "Run 'gtp help' for usage." >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
