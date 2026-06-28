@@ -16,9 +16,10 @@ When you have multiple GitHub accounts (personal, work, client), you constantly 
 ### Homebrew (recommended)
 
 ```bash
-brew tap sarangkkl/gtp
-brew install gtp
+brew install sarangkkl/gtp/gtp
 ```
+
+> If prompted about an untrusted tap, run `brew trust sarangkkl/gtp` then retry.
 
 ### Manual
 
