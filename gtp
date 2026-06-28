@@ -110,7 +110,7 @@ gtp_infer_repo_dir() {
   local last_positional=""
   local skip_next=false
 
-  for arg in "${args[@]}"; do
+  for arg in "${args[@]+"${args[@]}"}"; do
     if $skip_next; then
       skip_next=false
       continue
